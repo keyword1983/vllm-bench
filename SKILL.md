@@ -119,6 +119,57 @@ python scripts/run_benchmark.py --help
 | `metrics_after.txt` | Benchmark 後的 vllm `/metrics` 快照 |
 | `engine_params.txt` | 從 `/v1/models` 取得的 engine 資訊（JSON） |
 
+## 結果摘要
+
+### 自動印出（run_benchmark.py）
+
+每次 benchmark 結束後，`run_benchmark.py` 會自動印出效能指標表格：
+
+```
+📊 Performance Metrics Summary:
+=====================================================================================
+Group           in    out   n    Tput(tok/s)   TTFT(ms)   TPOT(ms)   ITL(ms)  E2EL(ms)
+-------------------------------------------------------------------------------------
+throughput     200   250    8       1234.5       45.6       12.3       12.3     456.7
+throughput     200   250   16       2345.6       67.8       14.5       14.5     678.9
+latency        100   100    1        123.4       23.4        8.9        8.9     123.4
+=====================================================================================
+```
+
+### 事後整理（summarize_results.py）
+
+可單獨執行，掃描 `output/` 目錄下所有結果 JSON 並整理：
+
+```bash
+# 印出表格（掃描預設 output/ 目錄）
+python scripts/summarize_results.py
+
+# 指定目錄
+python scripts/summarize_results.py --output-dir /tmp/bench_results
+
+# 匯出 CSV
+python scripts/summarize_results.py --csv output/summary.csv
+
+# 依 throughput 排序（由高到低）
+python scripts/summarize_results.py --sort-by throughput
+```
+
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| `--output-dir` | `output` | 結果 JSON 所在目錄 |
+| `--csv` | 無 | 匯出 CSV 的路徑（選填） |
+| `--sort-by` | `group` | 排序欄位：`group` / `input_len` / `output_len` / `num_prompts` / `throughput` |
+
+### 指標說明
+
+| 欄位 | 說明 |
+|------|------|
+| `Tput(tok/s)` | output_throughput，每秒輸出 token 數 |
+| `TTFT(ms)` | mean_ttft_ms，首個 token 平均延遲 |
+| `TPOT(ms)` | mean_tpot_ms，每個輸出 token 平均時間 |
+| `ITL(ms)` | mean_itl_ms，相鄰 token 間隔時間 |
+| `E2EL(ms)` | mean_e2el_ms，端對端總延遲 |
+
 ## 前置條件
 
 - `vllm` 已安裝，且包含 `vllm bench serve` CLI

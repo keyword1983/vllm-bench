@@ -319,6 +319,73 @@ def list_models(base_url: str, api_key: str, models_path: str) -> None:
         print(f"  ℹ️  model / tokenizer / max_model_len will be auto-detected")
 
 
+# ---------------------------------------------------------------------------
+# Performance metrics table
+# ---------------------------------------------------------------------------
+
+_NA = "N/A"
+
+
+def _fmt(value, fmt=".1f") -> str:
+    """Format a numeric value or return N/A if None."""
+    if value is None:
+        return _NA
+    try:
+        return format(float(value), fmt)
+    except (TypeError, ValueError):
+        return _NA
+
+
+def _print_metrics_table(all_results: list, output_dir: str) -> None:
+    """Read result JSON files and print a performance metrics summary table."""
+    rows = []
+    for r in all_results:
+        if r["returncode"] != 0:
+            continue
+        json_path = os.path.join(output_dir, r["result_file"])
+        data: dict = {}
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+        rows.append({
+            "group":      r["group"],
+            "input_len":  r["input_len"],
+            "output_len": r["output_len"],
+            "n":          r["num_prompts"],
+            "throughput": data.get("output_throughput"),
+            "ttft":       data.get("mean_ttft_ms"),
+            "tpot":       data.get("mean_tpot_ms"),
+            "itl":        data.get("mean_itl_ms"),
+            "e2el":       data.get("mean_e2el_ms"),
+        })
+
+    if not rows:
+        return
+
+    header = (
+        f"{'Group':<14} {'in':>6} {'out':>5} {'n':>4}  "
+        f"{'Tput(tok/s)':>11}  {'TTFT(ms)':>9}  "
+        f"{'TPOT(ms)':>9}  {'ITL(ms)':>8}  {'E2EL(ms)':>9}"
+    )
+    sep = "=" * 85
+    dash = "-" * 85
+
+    print(f"\n📊 Performance Metrics Summary:")
+    print(sep)
+    print(header)
+    print(dash)
+    for row in rows:
+        print(
+            f"{row['group']:<14} {row['input_len']:>6} {row['output_len']:>5} {row['n']:>4}  "
+            f"{_fmt(row['throughput']):>11}  {_fmt(row['ttft']):>9}  "
+            f"{_fmt(row['tpot']):>9}  {_fmt(row['itl']):>8}  {_fmt(row['e2el']):>9}"
+        )
+    print(sep)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -458,6 +525,11 @@ def main() -> None:
             f"n={r['num_prompts']:3d}  ->  {r['result_file']}"
         )
     print(f"\nOutput directory: {os.path.abspath(args.output_dir)}/")
+
+    # ------------------------------------------------------------------
+    # Step 6b: Print performance metrics table
+    # ------------------------------------------------------------------
+    _print_metrics_table(all_results, args.output_dir)
 
     # ------------------------------------------------------------------
     # Step 7: Print results to stdout (for K8s Job log retrieval)

@@ -88,6 +88,9 @@ def parse_args() -> argparse.Namespace:
                         "using --host/--port. Required when server does not return 'max_model_len' field.")
     p.add_argument("--list-models",    action="store_true",
                    help="List all available models from the server and exit.")
+    p.add_argument("--print-results",  action="store_true",
+                   help="Print all result JSON files to stdout after benchmark "
+                        "(used by K8s Job launcher to retrieve results via pod logs).")
     return p.parse_args()
 
 
@@ -455,6 +458,19 @@ def main() -> None:
             f"n={r['num_prompts']:3d}  ->  {r['result_file']}"
         )
     print(f"\nOutput directory: {os.path.abspath(args.output_dir)}/")
+
+    # ------------------------------------------------------------------
+    # Step 7: Print results to stdout (for K8s Job log retrieval)
+    # ------------------------------------------------------------------
+    if args.print_results:
+        print("\n===BENCHMARK_RESULTS_START===")
+        for r in all_results:
+            json_path = os.path.join(args.output_dir, r["result_file"])
+            if os.path.exists(json_path):
+                print(f"===FILE:{r['result_file']}===")
+                with open(json_path, "r", encoding="utf-8") as f:
+                    print(f.read())
+        print("===BENCHMARK_RESULTS_END===")
 
 
 if __name__ == "__main__":

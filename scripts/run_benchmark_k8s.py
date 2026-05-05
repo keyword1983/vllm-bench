@@ -217,7 +217,7 @@ class BenchmarkK8sRunner:
         - No GPU requested; NVIDIA_VISIBLE_DEVICES=none to prevent GPU allocation
         - Appends --print-results so results are emitted to stdout for log retrieval
         """
-        command = ["python", "/scripts/run_benchmark.py"] + bench_args + ["--print-results"]
+        command = ["python3", "/scripts/run_benchmark.py"] + bench_args + ["--print-results"]
 
         return {
             "apiVersion": "batch/v1",

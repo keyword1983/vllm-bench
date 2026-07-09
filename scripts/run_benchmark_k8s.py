@@ -12,27 +12,6 @@ The script:
   4. Reads Pod logs and extracts JSON results
   5. Saves results to local output/ directory
   6. Cleans up Job + ConfigMap
-
-Usage:
-    # Via LiteLLM proxy (recommended)
-    python scripts/run_benchmark_k8s.py \\
-        --base-url https://litellm-xxx.sslip.io \\
-        --api-key sk-xxx \\
-        --model my-model \\
-        --namespace frank-dev
-
-    # List available models first
-    python scripts/run_benchmark_k8s.py \\
-        --base-url https://litellm-xxx.sslip.io \\
-        --api-key sk-xxx \\
-        --list-models
-
-    # Keep Job/ConfigMap after completion for debugging
-    python scripts/run_benchmark_k8s.py \\
-        --base-url https://litellm-xxx.sslip.io \\
-        --api-key sk-xxx \\
-        --model my-model \\
-        --no-cleanup
 """
 import argparse
 import json
@@ -46,7 +25,7 @@ import time
 # ---------------------------------------------------------------------------
 
 class K8sCurlClient:
-    """Lightweight K8s client using curl via subprocess (no SDK dependency)."""
+    """Lightweight K8s client using curl via subprocess with a kubectl fallback for local testing."""
 
     def __init__(self):
         self.token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -56,8 +35,11 @@ class K8sCurlClient:
         if not os.path.exists(self.token_path):
             self.token_path = None
             self.ca_path    = None
-            print("⚠️  ServiceAccount token not found. K8s API calls will likely fail.",
+            self.use_kubectl = True
+            print("ℹ️  Running outside cluster. Will use local 'kubectl' CLI for K8s API operations.",
                   file=sys.stderr)
+        else:
+            self.use_kubectl = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -104,10 +86,20 @@ class K8sCurlClient:
     # ------------------------------------------------------------------
 
     def create_configmap(self, namespace: str, body: dict) -> dict:
+        if self.use_kubectl:
+            proc = subprocess.run(["kubectl", "apply", "-f", "-", "-n", namespace],
+                                  input=json.dumps(body), capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"kubectl apply configmap failed: {proc.stderr}")
+            return body
         url = f"{self.api_server}/api/v1/namespaces/{namespace}/configmaps"
         return self._parse(self._run_curl("POST", url, data=body))
 
     def delete_configmap(self, namespace: str, name: str) -> None:
+        if self.use_kubectl:
+            subprocess.run(["kubectl", "delete", "configmap", name, "-n", namespace],
+                           capture_output=True)
+            return
         url = f"{self.api_server}/api/v1/namespaces/{namespace}/configmaps/{name}"
         self._run_curl("DELETE", url)
 
@@ -116,16 +108,31 @@ class K8sCurlClient:
     # ------------------------------------------------------------------
 
     def create_job(self, namespace: str, body: dict) -> dict:
+        if self.use_kubectl:
+            proc = subprocess.run(["kubectl", "create", "-f", "-", "-n", namespace],
+                                  input=json.dumps(body), capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"kubectl create job failed: {proc.stderr}")
+            return body
         url = f"{self.api_server}/apis/batch/v1/namespaces/{namespace}/jobs"
         return self._parse(self._run_curl("POST", url, data=body))
 
     def get_job(self, namespace: str, name: str) -> dict:
+        if self.use_kubectl:
+            proc = subprocess.run(["kubectl", "get", "job", name, "-n", namespace, "-o", "json"],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                return {}
+            return json.loads(proc.stdout)
         url = f"{self.api_server}/apis/batch/v1/namespaces/{namespace}/jobs/{name}"
         raw = self._run_curl("GET", url)
         return json.loads(raw) if raw else {}
 
     def delete_job(self, namespace: str, name: str) -> None:
-        """Delete Job with cascade (propagationPolicy=Foreground deletes Pods too)."""
+        if self.use_kubectl:
+            subprocess.run(["kubectl", "delete", "job", name, "-n", namespace, "--cascade=foreground"],
+                           capture_output=True)
+            return
         url = f"{self.api_server}/apis/batch/v1/namespaces/{namespace}/jobs/{name}"
         body = {"propagationPolicy": "Foreground"}
         self._run_curl("DELETE", url, data=body)
@@ -135,12 +142,24 @@ class K8sCurlClient:
     # ------------------------------------------------------------------
 
     def list_pods(self, namespace: str, label_selector: str) -> dict:
+        if self.use_kubectl:
+            proc = subprocess.run(["kubectl", "get", "pods", "-n", namespace, "-l", label_selector, "-o", "json"],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                return {}
+            return json.loads(proc.stdout)
         url = (f"{self.api_server}/api/v1/namespaces/{namespace}/pods"
                f"?labelSelector={label_selector}")
         raw = self._run_curl("GET", url)
         return json.loads(raw) if raw else {}
 
     def get_pod_log(self, namespace: str, pod_name: str) -> str:
+        if self.use_kubectl:
+            proc = subprocess.run(["kubectl", "logs", pod_name, "-n", namespace],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"kubectl logs failed: {proc.stderr}")
+            return proc.stdout
         url = f"{self.api_server}/api/v1/namespaces/{namespace}/pods/{pod_name}/log"
         return self._run_curl("GET", url)
 
@@ -149,11 +168,9 @@ class K8sCurlClient:
 # Benchmark K8s runner
 # ---------------------------------------------------------------------------
 
-# Path to run_benchmark.py relative to this file
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _RUN_BENCHMARK_PY = os.path.join(_SCRIPT_DIR, "run_benchmark.py")
 
-# Marker tokens embedded in run_benchmark.py --print-results output
 _RESULTS_START = "===BENCHMARK_RESULTS_START==="
 _RESULTS_END   = "===BENCHMARK_RESULTS_END==="
 _FILE_PREFIX   = "===FILE:"
@@ -170,17 +187,21 @@ class BenchmarkK8sRunner:
         timeout: int = 3600,
         no_cleanup: bool = False,
         output_dir: str = "output",
+        cpu_request: str = "500m",
+        mem_request: str = "1Gi",
+        cpu_limit: str = "2",
+        mem_limit: str = "4Gi",
     ):
         self.namespace   = namespace
         self.vllm_image  = vllm_image
         self.timeout     = timeout
         self.no_cleanup  = no_cleanup
         self.output_dir  = output_dir
+        self.cpu_request = cpu_request
+        self.mem_request = mem_request
+        self.cpu_limit   = cpu_limit
+        self.mem_limit   = mem_limit
         self.k8s         = K8sCurlClient()
-
-    # ------------------------------------------------------------------
-    # Build K8s resource bodies
-    # ------------------------------------------------------------------
 
     def _unique_name(self) -> str:
         """Generate a unique short name based on timestamp."""
@@ -210,13 +231,7 @@ class BenchmarkK8sRunner:
         }
 
     def build_job_body(self, job_name: str, cm_name: str, bench_args: list) -> dict:
-        """
-        Build a batch/v1 Job spec.
-        - Uses vllm image (has vllm CLI installed)
-        - Mounts ConfigMap script at /scripts/run_benchmark.py
-        - No GPU requested; NVIDIA_VISIBLE_DEVICES=none to prevent GPU allocation
-        - Appends --print-results so results are emitted to stdout for log retrieval
-        """
+        """Build a batch/v1 Job spec with resource limits."""
         command = ["python3", "/scripts/run_benchmark.py"] + bench_args + ["--print-results"]
 
         return {
@@ -241,36 +256,46 @@ class BenchmarkK8sRunner:
                             "image":   self.vllm_image,
                             "command": command,
                             "env": [
-                                # Prevent the container from claiming any GPU
                                 {"name": "NVIDIA_VISIBLE_DEVICES", "value": "none"},
+                                {"name": "VLLM_TARGET_DEVICE",      "value": "cpu"},
                                 {"name": "VLLM_NO_USAGE_STATS",    "value": "1"},
                                 {"name": "VLLM_DO_NOT_TRACK",      "value": "1"},
                             ],
-                            # Explicitly request zero GPU resources
                             "resources": {
-                                "requests": {"cpu": "1", "memory": "2Gi"},
-                                "limits":   {"cpu": "4", "memory": "8Gi"},
+                                "requests": {"cpu": self.cpu_request, "memory": self.mem_request},
+                                "limits":   {"cpu": self.cpu_limit, "memory": self.mem_limit},
                             },
-                            "volumeMounts": [{
-                                "name":      "scripts",
-                                "mountPath": "/scripts",
-                            }],
+                            "volumeMounts": [
+                                {
+                                    "name":      "scripts",
+                                    "mountPath": "/scripts",
+                                },
+                                {
+                                    "name":      "models-volume",
+                                    "mountPath": "/models",
+                                }
+                            ],
                         }],
-                        "volumes": [{
-                            "name": "scripts",
-                            "configMap": {
-                                "name": cm_name,
-                                "defaultMode": 0o755,
+                        "volumes": [
+                            {
+                                "name": "scripts",
+                                "configMap": {
+                                    "name": cm_name,
+                                    "defaultMode": 0o755,
+                                },
                             },
-                        }],
+                            {
+                                "name": "models-volume",
+                                "hostPath": {
+                                    "path": "/var/lib/afsbox/models",
+                                    "type": "Directory"
+                                }
+                            }
+                        ],
                     },
                 },
             },
         }
-
-    # ------------------------------------------------------------------
-    # Lifecycle methods
-    # ------------------------------------------------------------------
 
     def submit(self, bench_args: list) -> tuple:
         """Create ConfigMap and Job; return (job_name, cm_name)."""
@@ -286,15 +311,13 @@ class BenchmarkK8sRunner:
         job_body = self.build_job_body(name, cm_name, bench_args)
         self.k8s.create_job(self.namespace, job_body)
         print(f"  ✅ Job created  (namespace={self.namespace}, image={self.vllm_image})")
+        print(f"  📋 resources: requests(cpu={self.cpu_request}, mem={self.mem_request}) limits(cpu={self.cpu_limit}, mem={self.mem_limit})")
         print(f"  📋 bench args: {' '.join(bench_args)}")
 
         return name, cm_name
 
     def wait_for_completion(self, job_name: str) -> bool:
-        """
-        Poll Job status every 15 seconds until succeeded/failed or timeout.
-        Returns True if Job succeeded, False otherwise.
-        """
+        """Poll Job status every 15 seconds until succeeded/failed or timeout."""
         print(f"\n⏳ Waiting for Job '{job_name}' to complete (timeout={self.timeout}s) ...")
         deadline = time.time() + self.timeout
         poll_interval = 15
@@ -335,7 +358,6 @@ class BenchmarkK8sRunner:
             print("  ⚠️  No pods found for this Job.", file=sys.stderr)
             return ""
 
-        # Use the first (and normally only) pod
         pod_name = pods[0]["metadata"]["name"]
         print(f"  📌 Pod: {pod_name}")
         log = self.k8s.get_pod_log(self.namespace, pod_name)
@@ -343,19 +365,21 @@ class BenchmarkK8sRunner:
         return log
 
     def parse_and_save_results(self, log_text: str) -> list:
-        """
-        Extract JSON result files from the log between marker tokens and save
-        them to self.output_dir.  Returns list of saved filenames.
-        """
+        """Extract JSON and other files from the log and save them."""
         os.makedirs(self.output_dir, exist_ok=True)
         saved = []
 
-        # Locate the results block
         start_idx = log_text.find(_RESULTS_START)
         end_idx   = log_text.find(_RESULTS_END)
 
         if start_idx == -1 or end_idx == -1:
             print("  ⚠️  No benchmark results block found in logs.", file=sys.stderr)
+            print("\n📋 Last 50 lines of Pod logs for diagnostic purposes:")
+            print("-" * 65)
+            lines = log_text.splitlines()
+            for line in lines[-50:]:
+                print(line)
+            print("-" * 65)
             return saved
 
         block = log_text[start_idx + len(_RESULTS_START):end_idx]
@@ -406,11 +430,7 @@ class BenchmarkK8sRunner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=(
-            "Run vllm benchmark via a K8s Job.\n"
-            "Packages run_benchmark.py into a ConfigMap, submits a Job using the\n"
-            "vllm image, waits for completion, and retrieves results from Pod logs."
-        ),
+        description="Run vllm benchmark via a K8s Job.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -439,15 +459,22 @@ def parse_args() -> argparse.Namespace:
                    help="API endpoint (default: /v1/completions)")
     p.add_argument("--dataset-name",  default="random",
                    help="Dataset name (default: random)")
+    p.add_argument("--dataset-path",  default=None,
+                   help="Path to the dataset file")
+    p.add_argument("--random-range-ratio", type=float, default=0.0,
+                   help="Range ratio for random dataset generation")
     p.add_argument("--request-rate",  default="inf",
                    help="Requests per second (default: inf)")
     p.add_argument("--models-path",   default=None,
                    help="Override path for models endpoint")
     p.add_argument("--list-models",   action="store_true",
-                   help="List available models from the server and exit "
-                        "(runs locally, no K8s Job needed)")
+                   help="List available models from the server and exit")
     p.add_argument("--output-dir",    default="output",
                    help="Local directory to save retrieved results (default: output)")
+    p.add_argument("--no-warmup",      action="store_true",
+                   help="Disable warm-up request")
+    p.add_argument("--skip-models",    action="store_true",
+                   help="Skip /v1/models auto-detection. Requires --model, --tokenizer, and --max-model-len.")
 
     # ── K8s-specific ──────────────────────────────────────────────────
     p.add_argument("--namespace",     default="frank-dev",
@@ -457,17 +484,51 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout",       type=int, default=3600,
                    help="Seconds to wait for Job completion (default: 3600)")
     p.add_argument("--no-cleanup",    action="store_true",
-                   help="Keep Job and ConfigMap after completion (useful for debugging)")
+                   help="Keep Job and ConfigMap after completion")
+    p.add_argument("--k8s-cpu-request", default="500m",
+                   help="K8s CPU request for the Job container (default: 500m)")
+    p.add_argument("--k8s-mem-request", default="1Gi",
+                   help="K8s memory request for the Job container (default: 1Gi)")
+    p.add_argument("--k8s-cpu-limit",   default="2",
+                   help="K8s CPU limit for the Job container (default: 2)")
+    p.add_argument("--k8s-mem-limit",   default="4Gi",
+                   help="K8s memory limit for the Job container (default: 4Gi)")
 
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Helpers – list models locally (no K8s needed)
-# ---------------------------------------------------------------------------
+def detect_models_path(base_url: str, api_key: str = None) -> str:
+    """
+    Dynamically detect whether to use /v1/models or /models.
+    Tries /v1/models first, then falls back to /models if /v1/models returns 404.
+    """
+    import requests
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    
+    # Try /v1/models first
+    try:
+        url = f"{base_url}/v1/models"
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 404:
+            return "/v1/models"
+    except Exception:
+        pass
+
+    # Try /models as fallback
+    try:
+        url = f"{base_url}/models"
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 404:
+            return "/models"
+    except Exception:
+        pass
+
+    # Fallback to standard OpenAI if both probes fail or timeout
+    return "/models" if ("litellm" in base_url.lower() or "proxy" in base_url.lower()) else "/v1/models"
+
 
 def _list_models_local(args: argparse.Namespace) -> None:
-    """Fetch and print models directly from this process (mirrors run_benchmark.py logic)."""
+    """Fetch and print models directly from this process."""
     try:
         import requests
     except ImportError:
@@ -476,7 +537,7 @@ def _list_models_local(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     base_url    = args.base_url.rstrip("/") if args.base_url else f"http://{args.host}:{args.port}"
-    models_path = args.models_path or ("/models" if args.base_url else "/v1/models")
+    models_path = args.models_path or detect_models_path(base_url, args.api_key)
     url         = f"{base_url}{models_path}"
     headers     = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
 
@@ -501,10 +562,6 @@ def _list_models_local(args: argparse.Namespace) -> None:
         print(f"      --api-key <your_key> \\")
     print(f"      --model <model_id>")
 
-
-# ---------------------------------------------------------------------------
-# Build bench_args list to forward to run_benchmark.py inside the Job
-# ---------------------------------------------------------------------------
 
 def build_bench_args(args: argparse.Namespace) -> list:
     """Convert parsed args into a list of CLI flags for run_benchmark.py."""
@@ -531,56 +588,61 @@ def build_bench_args(args: argparse.Namespace) -> list:
         bench += ["--endpoint", args.endpoint]
     if args.dataset_name and args.dataset_name != "random":
         bench += ["--dataset-name", args.dataset_name]
+    if args.dataset_path:
+        bench += ["--dataset-path", args.dataset_path]
+    if args.random_range_ratio > 0.0:
+        bench += ["--random-range-ratio", str(args.random_range_ratio)]
     if args.request_rate and args.request_rate != "inf":
         bench += ["--request-rate", args.request_rate]
     if args.models_path:
         bench += ["--models-path", args.models_path]
+    if args.no_warmup:
+        bench += ["--no-warmup"]
+    if args.skip_models:
+        bench += ["--skip-models"]
 
-    # Always write results to /output inside the Job container
     bench += ["--output-dir", "/output"]
 
     return bench
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     args = parse_args()
 
-    # --list-models runs locally; no K8s Job needed
     if args.list_models:
         _list_models_local(args)
         sys.exit(0)
 
     runner = BenchmarkK8sRunner(
-        namespace  = args.namespace,
-        vllm_image = args.vllm_image,
-        timeout    = args.timeout,
-        no_cleanup = args.no_cleanup,
-        output_dir = args.output_dir,
+        namespace   = args.namespace,
+        vllm_image  = args.vllm_image,
+        timeout     = args.timeout,
+        no_cleanup  = args.no_cleanup,
+        output_dir  = args.output_dir,
+        cpu_request = args.k8s_cpu_request,
+        mem_request = args.k8s_mem_request,
+        cpu_limit   = args.k8s_cpu_limit,
+        mem_limit   = args.k8s_mem_limit,
     )
 
     job_name = cm_name = None
     succeeded = False
 
     try:
-        # 1. Build args to forward, submit ConfigMap + Job
         bench_args = build_bench_args(args)
         job_name, cm_name = runner.submit(bench_args)
-
-        # 2. Wait for Job to finish
         succeeded = runner.wait_for_completion(job_name)
-
-        # 3. Retrieve logs regardless of success/failure (useful for debugging)
         log_text = runner.fetch_logs(job_name)
 
-        # 4. Parse and save result JSON files
+        # Save the raw pod logs to output/pod_log.txt for troubleshooting
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "pod_log.txt"), "w", encoding="utf-8") as fh:
+            fh.write(log_text)
+        print("  💾 Saved: pod_log.txt")
+
         print(f"\n💾 Parsing and saving results to '{args.output_dir}/' ...")
         saved = runner.parse_and_save_results(log_text)
 
-        # 5. Summary
         print(f"\n{'=' * 65}")
         if succeeded:
             print(f"✅ Benchmark Job completed successfully")
@@ -594,7 +656,6 @@ def main() -> None:
         print(f"{'=' * 65}")
 
     finally:
-        # 6. Cleanup (unless --no-cleanup or Job was never created)
         if job_name and not args.no_cleanup:
             runner.cleanup(job_name, cm_name)
         elif args.no_cleanup:

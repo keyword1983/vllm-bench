@@ -1,331 +1,130 @@
 ---
 name: vllm-bench
-description: 對已運行中的 vllm OpenAI-compatible server 執行 benchmark 效能測試。自動從 /v1/models API 偵測 model 名稱、tokenizer 及 max_model_len，使用 `vllm bench serve` CLI 執行三組標準測試（長文本壓力、吞吐量、延遲），並從 /metrics endpoint 收集 benchmark 前後的系統指標。適用於評估 vllm 推論服務的 throughput、TTFT、TPOT、ITL 等效能指標。
+description: 對已運行中支援 OpenAI-compatible API 的任何 LLM 推論服務（如 vLLM、sglang、Ollama、TGI 或 LiteLLM Proxy 等）執行 benchmark 效能測試。自動從 /v1/models API 偵測 model 名稱、tokenizer 及 max_model_len，使用 `vllm bench serve` CLI 執行三組標準測試（長文本壓力、吞吐量、延遲），並在可能時從 /metrics endpoint 收集系統指標進行分析診斷。適用於評估推論服務的 throughput、TTFT、TPOT、ITL 等效能指標。
 ---
 
 # vllm Benchmark Serving Skill
 
-## 可用腳本
+本 Skill 專門用於對運作中且支援 OpenAI-compatible API 的任何 LLM 推論服務（如 vLLM、sglang、Ollama、TGI，以及經由 LiteLLM 等 Proxy 封裝的 API）進行吞吐量、延遲、長文本上下文的基準測試，並在服務端支援時分析 Prometheus 監控指標以判定瓶頸。
 
-- `scripts/run_benchmark.py` — 執行完整 benchmark 流程（需要 vllm 環境）
-- `scripts/run_benchmark_k8s.py` — 透過 K8s Job 執行 benchmark（**Agent 環境無 vllm 時使用**）
+## 📂 腳本結構與工具
 
-**永遠先執行 `--help` 確認用法，請勿直接讀取原始碼。**
+- [scripts/run_benchmark.py](file:///home/asus/.gemini/skills/vllm-bench/scripts/run_benchmark.py) — 執行完整 benchmark 流程。**（本機裝有 vllm 時使用）**
+- [scripts/run_benchmark_k8s.py](file:///home/asus/.gemini/skills/vllm-bench/scripts/run_benchmark_k8s.py) — 透過輕量級 K8s Job 遠端執行 benchmark。**（Agent 本地無 vllm 時使用）**
+- [scripts/summarize_results.py](file:///home/asus/.gemini/skills/vllm-bench/scripts/summarize_results.py) — 整理 `output/` 數據，產生 CLI 表格、CSV、Markdown Mermaid 報告與 Chart.js HTML 報告。
 
-```bash
-python scripts/run_benchmark.py --help
-python scripts/run_benchmark_k8s.py --help
-```
+---
 
-## 決策樹
+## 🧭 決策樹與工作流程
 
-```
-使用者要求執行 benchmark
-├── Agent 環境有安裝 vllm？
-│   ├── YES → 直接執行（run_benchmark.py）
-│   │   ├── 直連 vllm server（host:port）
-│   │   │   └── python scripts/run_benchmark.py --host <host> --port <port>
-│   │   └── 透過 LiteLLM proxy（base-url）
-│   │       ├── 步驟 1：查詢可用模型
-│   │       │         python scripts/run_benchmark.py \
-│   │       │             --base-url <url> --api-key <key> --list-models
-│   │       └── 步驟 2：指定 model 執行
-│   │                 python scripts/run_benchmark.py \
-│   │                     --base-url <url> --api-key <key> \
-│   │                     --model <model_id> --max-model-len <value>
-│   └── NO → 透過 K8s Job 執行（run_benchmark_k8s.py）
-│       ├── 步驟 1：查詢可用模型（本地執行，不需 K8s）
-│       │         python scripts/run_benchmark_k8s.py \
-│       │             --base-url <url> --api-key <key> --list-models
-│       └── 步驟 2：建立 K8s Job 執行 benchmark
-│                 python scripts/run_benchmark_k8s.py \
-│                     --base-url <url> --api-key <key> \
-│                     --model <model_id> --namespace frank-dev
-```
-
-## 快速使用
-
-**查詢可用模型清單（先做這步）：**
-```bash
-python scripts/run_benchmark.py \
-    --base-url https://litellm-xxx.sslip.io \
-    --api-key sk-xxxxx \
-    --list-models
-```
-
-**執行完整預設測試（共 14 次）：**
-```bash
-python scripts/run_benchmark.py --host 10.110.134.151 --port 5000
-```
-
-**帶 API key 執行：**
-```bash
-python scripts/run_benchmark.py --host 10.110.134.151 --port 5000 --api-key sk-xxxxx
-```
-
-**透過 LiteLLM proxy（base-url 模式）：**
-```bash
-# tokenizer 指定 HuggingFace model name（推薦）
-python scripts/run_benchmark.py \
-    --base-url https://litellm-xxx.sslip.io \
-    --api-key sk-xxxxx \
-    --model 5glab-a40-qwen36-27b \
-    --tokenizer Qwen/Qwen3.6-27B \
-    --max-model-len 262144
-```
-
-**僅執行特定組別：**
-```bash
-python scripts/run_benchmark.py --host 10.110.134.151 --port 5000 --groups throughput latency
-```
-
-**查看所有參數：**
-```bash
-python scripts/run_benchmark.py --help
-```
-
-## 三組標準測試
-
-| 組別 | input_len | output_len | num_prompts | 說明 |
-|------|-----------|------------|-------------|------|
-| `long_context` | max_model_len - 2048（動態） | 2048 | 1, 5, 10 | 長文本壓力測試 |
-| `throughput` | 200 | 250 | 8, 16, 32, 64, 128 | 吞吐量測試 |
-| `latency` | 100 | 100 | 1, 8, 16, 32 | 延遲測試 |
-
-全部測試使用相同設定：
-- `--backend openai`
-- `--endpoint /v1/completions`
-- `--dataset-name random`
-- `--request-rate inf`
-
-## 自動偵測（來自 models API）
-
-| 連線模式 | model_name | tokenizer | max_model_len |
-|---------|------------|-----------|---------------|
-| `--host/--port`（直連 vllm） | ✅ 自動（`/v1/models` `id`）| ✅ 自動（`/v1/models` `root`）| ✅ 自動（`/v1/models` `max_model_len`）|
-| `--base-url`（LiteLLM proxy） | ✅ 自動（`/models`，需 `--model` 指定目標）| ✅ 自動（`/model/info` `hf_model_name`）| ✅ 自動（`/model/info` `max_tokens`）|
-
-**自動偵測優先序（LiteLLM proxy 模式）：**
-1. CLI 參數 `--tokenizer` / `--max-model-len`（最優先）
-2. `/model/info` 的 `hf_model_name` / `max_tokens`（自動查詢）
-3. 若 `/model/info` 403 → tokenizer fallback 為 model_name，max_model_len 需手動指定
-
-## 輸出檔案（存於 `output/`）
-
-| 檔案 | 說明 |
-|------|------|
-| `{safe_model_name}_{input_len}-{output_len}_{num_prompts}.json` | 每次測試的詳細效能結果 |
-| `metrics_before.txt` | Benchmark 前的 vllm `/metrics` 快照 |
-| `metrics_after.txt` | Benchmark 後的 vllm `/metrics` 快照 |
-| `engine_params.txt` | 從 `/v1/models` 取得的 engine 資訊（JSON） |
-
-## 結果摘要
-
-### 自動印出（run_benchmark.py）
-
-每次 benchmark 結束後，`run_benchmark.py` 會自動印出效能指標表格：
+當 Agent 被要求進行 vLLM Benchmark 時，應遵循以下決策與執行步驟：
 
 ```
-📊 Performance Metrics Summary:
-=====================================================================================
-Group           in    out   n    Tput(tok/s)   TTFT(ms)   TPOT(ms)   ITL(ms)  E2EL(ms)
--------------------------------------------------------------------------------------
-throughput     200   250    8       1234.5       45.6       12.3       12.3     456.7
-throughput     200   250   16       2345.6       67.8       14.5       14.5     678.9
-latency        100   100    1        123.4       23.4        8.9        8.9     123.4
-=====================================================================================
-```
-
-### 事後整理（summarize_results.py）
-
-可單獨執行，掃描 `output/` 目錄下所有結果 JSON 並整理：
-
-```bash
-# 印出表格（掃描預設 output/ 目錄）
-python scripts/summarize_results.py
-
-# 指定目錄
-python scripts/summarize_results.py --output-dir /tmp/bench_results
-
-# 匯出 CSV
-python scripts/summarize_results.py --csv output/summary.csv
-
-# 依 throughput 排序（由高到低）
-python scripts/summarize_results.py --sort-by throughput
-```
-
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| `--output-dir` | `output` | 結果 JSON 所在目錄 |
-| `--csv` | 無 | 匯出 CSV 的路徑（選填） |
-| `--sort-by` | `group` | 排序欄位：`group` / `input_len` / `output_len` / `num_prompts` / `throughput` |
-
-### 指標說明
-
-| 欄位 | 說明 |
-|------|------|
-| `Tput(tok/s)` | output_throughput，每秒輸出 token 數 |
-| `TTFT(ms)` | mean_ttft_ms，首個 token 平均延遲 |
-| `TPOT(ms)` | mean_tpot_ms，每個輸出 token 平均時間 |
-| `ITL(ms)` | mean_itl_ms，相鄰 token 間隔時間 |
-| `E2EL(ms)` | mean_e2el_ms，端對端總延遲 |
-
-## 前置條件
-
-- `vllm` 已安裝，且包含 `vllm bench serve` CLI
-- vllm server 已在指定 host:port 運行（支援跨容器，純 HTTP 存取）
-- Python 套件：`requests`（`pip install requests`）
-- （選填）若 server 啟用 API key 驗證，透過 `--api-key` 參數傳入
-
-## 注意事項
-
-⚠️ `long_context` 組的 `input_len` 會動態計算為 `max_model_len - 2048`。
-例如 `max_model_len=262144` 時，`input_len=260096`，每次請求的 token 數極大，
-**執行時間可能非常長**，請確認 server 資源充足再執行此組別。
-
-若只想快速測試，可使用 `--groups throughput latency` 跳過此組別。
-
-## 常見問題
-
-**❌ dataset-name 不支援錯誤**
-→ 改用 `--dataset-name random`（`vllm bench serve` 穩定版支援的標準資料集）
-
-**❌ 無法連線到 vllm server**
-→ 確認 server 已啟動，並確認 host/port 正確
-
-**❌ 401 Unauthorized 錯誤**
-→ server 啟用了 API key 驗證，請加上 `--api-key <your_key>` 參數
-
-**❌ max_model_len could not be detected**
-→ 腳本會自動嘗試從 `/model/info` 取得。若該端點回傳 403（API key 無權限），
-  請手動指定：`--max-model-len 262144`
-
-**❌ /model/info 403 Forbidden**
-→ 目前 API key 無權限存取 `/model/info`。請直接加上 `--max-model-len <value>`，
-  可從模型文件或管理員處確認 context length。
-  例如：`--max-model-len 262144`
-
-**❌ tokenizer 找不到（tokenizer: <model_id>）**
-→ 腳本會自動從 `/model/info` 的 `hf_model_name` 欄位取得正確的 HuggingFace tokenizer。
-  若 `/model/info` 回傳 403，請用 `--tokenizer` 手動指定：
-  - `--tokenizer Qwen/Qwen3.6-27B`
-  - `--tokenizer google/gemma-3-27b-it`
-  - `--tokenizer meta-llama/Llama-3.1-8B-Instruct`
-
-**❌ Model 'xxx' not found**
-→ 指定的 `--model` 不在清單中，腳本會印出所有可用模型供選擇
-
-**❌ vllm bench serve 指令不存在**
-→ 確認 vllm 版本，執行 `vllm --version` 及 `vllm bench --help`
-
-## K8s Job 執行方式
-
-### 使用時機
-
-Agent 容器環境**無法安裝 vllm**（例如：CPU-only 環境、套件衝突、CUDA 依賴問題）時，
-使用 `run_benchmark_k8s.py` 將 benchmark 工作委派給 K8s Job 執行。
-
-**運作原理：**
-```
-Agent Pod（無 vllm）
+[開始：使用者要求執行 Benchmark]
   │
-  ├─ 1. 將 run_benchmark.py 打包成 K8s ConfigMap
-  ├─ 2. 建立 K8s Job（image: vllm/vllm-openai:v0.20.1，無 GPU）
-  │       Job 內執行：python /scripts/run_benchmark.py ... --print-results
-  ├─ 3. Poll Job 狀態直到完成
-  ├─ 4. 讀取 Pod logs，解析 JSON 結果
-  ├─ 5. 存回 Agent 本地 output/ 目錄
-  └─ 6. 清理 Job + ConfigMap
+  ├── 步驟 1：檢測連線模式與可用模型
+  │     └── 目的：確認連線可用，並選定目標模型。
+  │     └── 指令：python scripts/run_benchmark.py --base-url <url> --api-key <key> --list-models
+  │
+  ├── 步驟 2：判斷執行環境
+  │     │
+  │     ├── [環境 A：Agent 容器內有安裝 vllm CLI]
+  │     │     └── 使用 run_benchmark.py
+  │     │     └── 指令：python scripts/run_benchmark.py --base-url <url> --model <model>
+  │     │
+  │     └── [環境 B：Agent 容器內無 vllm CLI（如 CPU-only 環境）]
+  │           └── 使用 run_benchmark_k8s.py (委派給輕量 K8s Job 容器)
+  │           └── 指令：python scripts/run_benchmark_k8s.py --base-url <url> --model <model> --namespace <ns>
+  │
+  └── 步驟 3：產生與分析報告 (自動執行)
+        ├── 1. 產生 CLI 效能表格與 `output/summary.csv`
+        ├── 2. 產生 `output/summary_report.md` (包含 Mermaid 折線圖)
+        ├── 3. 產生 `output/report.html` (互動式 Chart.js 網頁)
+        └── 4. 產生 `output/diagnostics.txt` (對比 /metrics 分析 KV Cache 搶占與瓶頸)
 ```
 
-### 快速使用（K8s 模式）
+---
 
-**查詢可用模型（本地執行，不建立 Job）：**
-```bash
-python scripts/run_benchmark_k8s.py \
-    --base-url https://litellm-xxx.sslip.io \
-    --api-key sk-xxxxx \
-    --list-models
-```
+## 🚀 核心功能與參數說明
 
-**執行 benchmark（透過 K8s Job）：**
-```bash
-python scripts/run_benchmark_k8s.py \
-    --base-url https://litellm-xxx.sslip.io \
-    --api-key sk-xxxxx \
-    --model 5glab-a40-qwen36-27b \
-    --namespace frank-dev
-```
+### 1. 三組預設標準測試
+ benchmark 自動執行以下三組測試（可使用 `--groups` 參數指定特定組別）：
 
-**僅執行特定組別（跳過長文本）：**
-```bash
-python scripts/run_benchmark_k8s.py \
-    --base-url https://litellm-xxx.sslip.io \
-    --api-key sk-xxxxx \
-    --model 5glab-a40-qwen36-27b \
-    --groups throughput latency \
-    --namespace frank-dev
-```
+| 組別 | 預設 input_len | 預設 output_len | 並發並行數 (num_prompts) | 說明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `long_context` | `max_model_len - 2048` | `2048` | `1`, `5`, `10` | 評估長文本上下文對記憶體與首字延遲 (TTFT) 的壓力 |
+| `throughput` | `200` | `250` | `8`, `16`, `32`, `64`, `128` | 測試高並發下的系統最大輸出吞吐量 |
+| `latency` | `100` | `100` | `1`, `8`, `16`, `32` | 評估在不同負載下相鄰 Token 產生的平滑度 (ITL/TPOT) |
 
-**保留 Job/ConfigMap 供 debug（不自動清理）：**
-```bash
-python scripts/run_benchmark_k8s.py \
-    --base-url https://litellm-xxx.sslip.io \
-    --api-key sk-xxxxx \
-    --model 5glab-a40-qwen36-27b \
-    --no-cleanup
-```
+### 2. 暖機機制 (Warm-up)
+*   **預設開啟**：在收集 pre-benchmark metrics 前，腳本會自動送出一筆輕量請求（1 prompts, 128 in, 128 out）來初始化 vLLM 的 KV Cache 與 Tokenizer，防止「冷啟動」效能偏低影響數據。
+*   **關閉方式**：在命令中加上 `--no-warmup` 旗標。
 
-### K8s 專用參數
+### 3. 資料集 (Dataset) 彈性
+*   預設使用 `--dataset-name random`。
+*   **擴充選項**：支援 `sharegpt`、`sonnet`、`hf` 等官方資料集。
+*   **自訂資料集**：可使用 `--dataset-path <path>` 載入本地自訂的 JSON 格式資料集。
+*   **隨機變化長度**：可加上 `--random-range-ratio 0.2`，使隨機產生的輸入/輸出長度有 +/-20% 波動，更貼近真實情境。
 
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| `--namespace` | `frank-dev` | 建立 Job 的 K8s namespace |
-| `--vllm-image` | `vllm/vllm-openai:v0.20.1` | Job 使用的 vllm Docker image |
-| `--timeout` | `3600` | 等待 Job 完成的最長秒數 |
-| `--no-cleanup` | `false` | 加上此 flag 保留 Job 和 ConfigMap（供 debug） |
+### 4. 智慧 Metrics 診斷 (Prometheus 整合)
+在測試前後，腳本會存取 vLLM 服務的 `/metrics`，並比對兩者差異：
+*   **GPU 快取飽和度**：分析 `gpu_cache_usage_factor` 是否超過 95%。
+*   **搶占 (Preemption) 檢測**：比對前後 `num_requests_preempted` 累計數。若發生搶占，報告會顯示警告並建議調整參數（如調小 `max_num_seqs` 或降低並發）。
+*   **排隊飽和**：分析 `num_requests_waiting` 來判定調度器是否過載。
 
-其餘參數（`--base-url`, `--api-key`, `--model`, `--tokenizer`, `--max-model-len`, `--groups` 等）
-與 `run_benchmark.py` 完全相同。
+### 5. 預設使用 Completions API 評測純粹性
+*   **預設端點**：預設使用 `--endpoint /v1/completions`（非 Chat API）。
+*   **為什麼不建議用 Chat API (`/v1/chat/completions`)？**
+    *   **避開 Chat Template 雜訊**：Chat API 會強行在伺服器端套用模型的 Chat Template 模板（如 `<|im_start|>user\n...`），多出來的模板 Token 會導致實際處理 Token 數大於設定的 `input_len`，造成 Throughput 與 TTFT 指標計算失真。
+    *   **精準衡量推理極限**：Completions API 能繞過模板字串解析與對話角色包裝的 Overhead，確保客戶端發送的 Token 數與引擎實際處理的 Token 數 100% 精準吻合，從而測出最純粹的 Engine 推理極限。
+*   **⚠️ 格式對應與自適應 Backend 切換 (防呆機制)**：
+    *   **格式差異**：`/v1/completions` 接收 `{"prompt": "..."}` 格式（對應 `--backend openai`）；而 `/v1/chat/completions` 則強制要求 `{"messages": [...]}` 對話格式（對應 `--backend openai-chat`）。若格式傳錯，API 伺服器會立刻回報 `400 Bad Request`。
+    *   **自動防護**：若因其他 Agent 的限制或特定框架需求，必須將端點設定為 `/v1/chat/completions`，本 Skill 已內建防呆邏輯。一旦偵測到 Chat 端點且 `--backend` 為預設的 `openai` 時，**會自動將後端切換為 `openai-chat`**，確保發送對齊的 JSON 格式，完全免去格式不對造成的連線崩潰。
 
-### ServiceAccount RBAC 權限需求
+---
 
-Agent Pod 的 ServiceAccount 需要以下權限才能建立/管理 K8s 資源：
+## 🛠️ K8s 模式進階設定
 
-```yaml
-rules:
-- apiGroups: [""]
-  resources: ["configmaps"]
-  verbs: ["create", "delete"]
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["list", "get"]
-- apiGroups: [""]
-  resources: ["pods/log"]
-  verbs: ["get"]
-- apiGroups: ["batch"]
-  resources: ["jobs"]
-  verbs: ["create", "get", "delete"]
-```
+當在 Agent 本地無 vllm 時，使用 `run_benchmark_k8s.py`。
 
-### K8s 模式常見問題
-
-**❌ ServiceAccount token not found**
-→ Agent Pod 未掛載 ServiceAccount token，確認 Pod spec 未設定 `automountServiceAccountToken: false`
-
-**❌ K8s API error: jobs is forbidden**
-→ ServiceAccount 缺少 `batch/jobs` 的 RBAC 權限，請聯繫管理員授權
-
-**❌ No benchmark results block found in logs**
-→ Job 內的 `run_benchmark.py` 執行失敗，使用 `--no-cleanup` 後手動查看 Pod logs：
+### 1. 輕量級資源自適應 (自動配適)
+本腳本只作為客戶端發送請求，因此預設被調配為非常輕量級的資源：
+- **CPU Request**: `500m` (半核) / **Limit**: `2`
+- **Memory Request**: `1Gi` / **Limit**: `4Gi` (載入大 tokenizer 緩衝)
+- **自訂參數**：若需調整（例如測試超大規模並發以防發送端 CPU 飽和），可傳入以下參數：
   ```bash
-  kubectl logs -n frank-dev -l job-name=<job-name>
+  python scripts/run_benchmark_k8s.py \
+      --k8s-cpu-request 1 --k8s-mem-request 2Gi \
+      --k8s-cpu-limit 4 --k8s-mem-limit 8Gi \
+      --model <model_id> --base-url <url>
   ```
 
-**❌ Job timeout**
-→ 預設 timeout 為 3600 秒，long_context 組測試時間極長，可加大：`--timeout 7200`
-  或跳過：`--groups throughput latency`
+### 2. Job 失敗防護與崩潰擷取
+若 K8s Job 失敗或超時，腳本不會只回傳「找不到 JSON」，而是會**自動擷取並印出 Pod Log 的最後 50 行**，供您立刻定位是否為連線超時、API Key 錯誤或 Pod OOM 等根本原因。
 
-## 參考資料
+---
 
-- `references/vllm_bench_serve_args.md`：`vllm bench serve` 完整參數說明Model Info
+## 📊 結果輸出與報告
+
+每次測試完成後，`output/` 目錄將會包含：
+
+| 檔案 | 說明 |
+| :--- | :--- |
+| `*.json` | 各個並發點測試的原始詳細指標 JSON。 |
+| `diagnostics.txt` | 系統指標分析（如 GPU Cache 使用率與 Preemption 診斷）。 |
+| `engine_params.txt` | 自動偵測到的模型名稱、Tokenizer 與最大長度限制。 |
+| `summary.csv` | （選填）以 CSV 格式匯出的簡短數據。 |
+| **`summary_report.md`** | **效能 Markdown 報告。內嵌 Mermaid 柱狀圖以渲染 Concurrency vs Throughput 曲線。** |
+| **`report.html`** | **互動式網頁報告。內嵌 Chart.js 以可視化 TTFT、TPOT、ITL 延遲曲線與吞吐量。** |
+
+---
+
+## 💡 給 Agent 的調用範例與引導提示
+
+若你是正在處理 benchmark 任務的 Agent：
+1. **第一步**：先用 `list-models` 指令檢測並回報使用者伺服器上目前有哪些模型可選。
+2. **第二步**：詢問使用者希望測試的模型與測試範疇（例如是否跳過長文本 `long_context`，或是否指定真實資料集）。
+3. **第三步**：執行測試。如果本機缺少 `vllm` CLI，一律自動改為使用 `run_benchmark_k8s.py`。
+4. **第四步**：測試結束後，使用 `summarize_results.py` 產出報告。
+5. **第五步**：提供 [summary_report.md](file:///path/to/output/summary_report.md) 和 [report.html](file:///path/to/output/report.html) 的絕對路徑點擊連結給使用者。
+6. **第六步**：在回覆中簡短總結 Throughput (最佳與最差) 以及 `/metrics` 診斷中是否有搶占警告，並給予使用者伺服器端配置的調整建議。
